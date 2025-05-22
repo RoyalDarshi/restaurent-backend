@@ -202,14 +202,14 @@ app.get("/api/sales/summary", async (req, res) => {
             SUM(fs.total_amount) AS total_sales,
             COUNT(DISTINCT fs.sales_id) AS total_orders,
             COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
-            COALESCE(SUM(CASE WHEN dst.sale_type = 'Machine' THEN fs.total_amount ELSE 0 END) / NULLIF(COUNT(DISTINCT CASE WHEN dst.sale_type = 'Machine' AND dn.node_id IS NOT NULL THEN dn.node_id ELSE NULL END), 0), 0) AS avg_sales_per_machine
+            COUNT(DISTINCT fs.invoice_number) AS total_invoices
         FROM
             fact_sales fs
         JOIN
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        JOIN
+        LEFT JOIN -- Use LEFT JOIN for dim_node if it's not always present for all sales
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
@@ -245,7 +245,7 @@ app.get("/api/sales/summary", async (req, res) => {
       totalSales: parseFloat(summary.total_sales || 0),
       totalOrders: parseInt(summary.total_orders || 0),
       avgOrderValue: parseFloat(summary.avg_order_value || 0),
-      avgSalesPerMachine: parseFloat(summary.avg_sales_per_machine || 0),
+      totalInvoices: parseInt(summary.total_invoices || 0),
     });
   } catch (err) {
     console.error("Error fetching summary data:", err.stack);
@@ -593,7 +593,7 @@ app.get("/api/product/by-family-group", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        JOIN
+        LEFT JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
@@ -659,7 +659,7 @@ app.get("/api/product/by-day-part", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        JOIN
+        LEFT JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
