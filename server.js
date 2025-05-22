@@ -110,7 +110,7 @@ app.get("/api/sales", async (req, res) => {
         SELECT
             fs.sales_id,
             dt.business_date,
-            dt.start_time,
+            TO_CHAR(TO_TIMESTAMP(dt.end_time::text, 'HH24MISS'), 'HH24:MI:SS') AS start_time,
             ds.store_id AS restaurant_id,
             dn.node_id AS machine_id,
             di.item_code AS product_id,
@@ -329,7 +329,7 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
 
   let query = `
         SELECT
-            EXTRACT(HOUR FROM dt.start_time::time) AS hour, -- Added ::time cast here
+            EXTRACT(HOUR FROM TO_TIMESTAMP(dt.end_time::text, 'HH24MISS')::time) AS hour,
             SUM(fs.total_amount) AS sales
         FROM
             fact_sales fs
@@ -368,7 +368,7 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
 
   query += `
         GROUP BY
-            EXTRACT(HOUR FROM dt.start_time::time)
+            EXTRACT(HOUR FROM TO_TIMESTAMP(dt.end_time::text, 'HH24MISS')::time)
         ORDER BY
             hour;
     `;
