@@ -33,7 +33,7 @@ pool.connect((err, client, release) => {
   if (err) {
     return console.error("Error acquiring client", err.stack);
   }
-  console.log("Connected to PostgreSQL database!", client);
+  console.log("Connected to PostgreSQL database!");
   release(); // Release the client back to the pool
 });
 
@@ -472,7 +472,7 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
         name: hourFormatted,
         sales: parseFloat(hourData ? hourData.sales : 0),
       };
-    }).slice(8, 22); // Assuming 8 am to 10 pm range for display, adjust as needed
+    }).slice(10, 24); // Assuming 8 am to 10 pm range for display, adjust as needed
 
     res.json(formattedData);
   } catch (err) {
@@ -560,7 +560,7 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
 app.get("/api/sales/by-product", async (req, res) => {
   const {
     timePeriod,
-    restaurantId,
+    restaurantId, // This is correctly received from the frontend
     machineId,
     transactionType,
     deliveryChannel,
@@ -588,8 +588,9 @@ app.get("/api/sales/by-product", async (req, res) => {
   const queryParams = [startDate, endDate];
   let paramIndex = 3;
 
+  // This is the crucial part for filtering by restaurantId
   if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
+    query += ` AND ds.store_id = $${paramIndex++}`; // Add restaurantId filter
     queryParams.push(restaurantId);
   }
   if (machineId && machineId !== "all") {
