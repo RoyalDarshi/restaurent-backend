@@ -1,23 +1,31 @@
 // server.js
+require("dotenv").config(); // Load environment variables from .env file
+
 const express = require("express");
 const { Pool } = require("pg");
-const cors = require("cors"); // Import cors
+const cors = require("cors");
+const NodeCache = require("node-cache"); // Import node-cache
 
 const app = express();
-const port = 3001; // Port for the backend server
+const port = process.env.PORT || 3001; // Use port from environment variable or default to 3001
+
+// Initialize NodeCache with a standard TTL (Time To Live) of 1 hour (3600 seconds)
+// and a checkperiod of 10 minutes (600 seconds) for expired keys.
+const myCache = new NodeCache({ stdTTL: 3600, checkperiod: 600 });
 
 // Use CORS middleware to allow requests from your React app
 app.use(cors());
 app.use(express.json()); // Enable JSON body parsing for POST requests
 
-// PostgreSQL database configuration
-// IMPORTANT: Replace with your actual PostgreSQL connection details
+// PostgreSQL database configuration using environment variables
 const pool = new Pool({
-  user: "postgres",
-  host: "192.168.29.91", // or your database host
-  database: "vamshi",
-  password: "vamshi",
-  port: 5432, // Default PostgreSQL port
+  user: process.env.DB_USER,
+  host: process.env.DB_HOST,
+  database: process.env.DB_DATABASE,
+  password: process.env.DB_PASSWORD,
+  port: process.env.DB_PORT,
+  max: 20, // Max number of clients in the pool, adjust as needed
+  idleTimeoutMillis: 30000, // Close idle clients after 30 seconds
 });
 
 // Test database connection
@@ -25,7 +33,7 @@ pool.connect((err, client, release) => {
   if (err) {
     return console.error("Error acquiring client", err.stack);
   }
-  console.log("Connected to PostgreSQL database!");
+  console.log("Connected to PostgreSQL database!", client);
   release(); // Release the client back to the pool
 });
 
@@ -104,20 +112,23 @@ app.get("/api/sales", async (req, res) => {
     productId, // This will be item_code for filtering
     machineId,
     transactionType,
+    deliveryChannel, // New filter
+    pod, // New filter
   } = req.query;
 
   let query = `
         SELECT
             fs.sales_id,
             dt.business_date,
-            TO_CHAR(TO_TIMESTAMP(dt.end_time::text, 'HH24MISS'), 'HH24:MI:SS') AS start_time,
             ds.store_id AS restaurant_id,
             dn.node_id AS machine_id,
             di.item_code AS product_id,
             di.item_description AS product_name,
             di.item_family_group,
             di.item_day_part,
-            dst.sale_type AS transaction_type,
+            fs.sale_type AS transaction_type,
+            fs.delivery_channel, -- Include delivery_channel
+            fs.pod, -- Include pod
             fs.total_amount,
             fs.item_qty
         FROM
@@ -130,45 +141,56 @@ app.get("/api/sales", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
-        WHERE 1=1
     `;
 
   const queryParams = [];
+  let whereConditions = [];
   let paramIndex = 1;
 
+  const { startDate, endDate } = getDateRange(timePeriod);
+  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
+  queryParams.push(startDate);
+  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
+  queryParams.push(endDate);
+
   if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
+    whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
   if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
+    whereConditions.push(`di.item_code = $${paramIndex++}`);
     queryParams.push(productId);
   }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndex++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
     queryParams.push(transactionType);
   }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    whereConditions.push(`fs.pod = $${paramIndex++}`);
+    queryParams.push(pod);
+  }
 
-  const { startDate, endDate } = getDateRange(timePeriod);
-  query += ` AND dt.business_date >= $${paramIndex++} AND dt.business_date <= $${paramIndex++}`;
-  queryParams.push(startDate, endDate);
+  if (whereConditions.length > 0) {
+    query += ` WHERE ` + whereConditions.join(" AND ");
+  }
+
+  // Add ORDER BY or LIMIT if needed for performance or specific display order
+  query += ` ORDER BY dt.business_date DESC, fs.sales_id DESC`; // Example ordering
 
   try {
     const { rows } = await pool.query(query, queryParams);
     const formattedTransactions = rows.map((row) => {
       const datePart = new Date(row.business_date);
-      const timePart = new Date(`1970-01-01T${row.start_time}`);
-      datePart.setHours(
-        timePart.getHours(),
-        timePart.getMinutes(),
-        timePart.getSeconds()
-      );
 
       return {
         id: row.sales_id,
@@ -177,7 +199,9 @@ app.get("/api/sales", async (req, res) => {
         productName: row.product_name,
         machineId: row.machine_id,
         transactionType: row.transaction_type,
-        timestamp: datePart.getTime(),
+        deliveryChannel: row.delivery_channel, // Include delivery_channel
+        pod: row.pod, // Include pod
+        timestamp: datePart.getTime(), // Using only business_date for timestamp
         amount: parseFloat(row.total_amount),
         quantity: parseFloat(row.item_qty),
         itemFamilyGroup: row.item_family_group,
@@ -193,8 +217,15 @@ app.get("/api/sales", async (req, res) => {
 
 // New API endpoint to get summary data
 app.get("/api/sales/summary", async (req, res) => {
-  const { timePeriod, restaurantId, productId, machineId, transactionType } =
-    req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -213,29 +244,45 @@ app.get("/api/sales/summary", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
-        WHERE
-            dt.business_date >= $1 AND dt.business_date <= $2
     `;
-  const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  const queryParams = [];
+  let whereConditions = [];
+  let paramIndex = 1;
+
+  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
+  queryParams.push(startDate);
+  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
+  queryParams.push(endDate);
 
   if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
+    whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
   if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
+    whereConditions.push(`di.item_code = $${paramIndex++}`);
     queryParams.push(productId);
   }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndex++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    whereConditions.push(`fs.pod = $${paramIndex++}`);
+    queryParams.push(pod);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` WHERE ` + whereConditions.join(" AND ");
   }
 
   try {
@@ -255,8 +302,15 @@ app.get("/api/sales/summary", async (req, res) => {
 
 // New API endpoint to get daily sales trend
 app.get("/api/sales/daily-trend", async (req, res) => {
-  const { timePeriod, restaurantId, productId, machineId, transactionType } =
-    req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -273,29 +327,45 @@ app.get("/api/sales/daily-trend", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
-        WHERE
-            dt.business_date >= $1 AND dt.business_date <= $2
     `;
-  const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  const queryParams = [];
+  let whereConditions = [];
+  let paramIndex = 1;
+
+  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
+  queryParams.push(startDate);
+  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
+  queryParams.push(endDate);
 
   if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
+    whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
   if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
+    whereConditions.push(`di.item_code = $${paramIndex++}`);
     queryParams.push(productId);
   }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndex++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    whereConditions.push(`fs.pod = $${paramIndex++}`);
+    queryParams.push(pod);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` WHERE ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -323,13 +393,20 @@ app.get("/api/sales/daily-trend", async (req, res) => {
 
 // New API endpoint to get hourly sales trend
 app.get("/api/sales/hourly-trend", async (req, res) => {
-  const { timePeriod, restaurantId, productId, machineId, transactionType } =
-    req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
         SELECT
-            EXTRACT(HOUR FROM TO_TIMESTAMP(dt.end_time::text, 'HH24MISS')::time) AS hour,
+            dt.hour AS hour,
             SUM(fs.total_amount) AS sales
         FROM
             fact_sales fs
@@ -341,8 +418,6 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -362,13 +437,23 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
         GROUP BY
-            EXTRACT(HOUR FROM TO_TIMESTAMP(dt.end_time::text, 'HH24MISS')::time)
+            dt.hour
         ORDER BY
             hour;
     `;
@@ -398,7 +483,14 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
 
 // New API endpoint to get sales by restaurant
 app.get("/api/sales/by-restaurant", async (req, res) => {
-  const { timePeriod, productId, machineId, transactionType } = req.query; // No restaurantId filter here
+  const {
+    timePeriod,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query; // No restaurantId filter here
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -415,8 +507,6 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -432,8 +522,18 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
@@ -458,7 +558,14 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
 
 // New API endpoint to get sales by product (top 5)
 app.get("/api/sales/by-product", async (req, res) => {
-  const { timePeriod, restaurantId, machineId, transactionType } = req.query; // No productId filter here
+  const {
+    timePeriod,
+    restaurantId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query; // No productId filter here
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -475,8 +582,6 @@ app.get("/api/sales/by-product", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -492,8 +597,18 @@ app.get("/api/sales/by-product", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
@@ -519,7 +634,14 @@ app.get("/api/sales/by-product", async (req, res) => {
 
 // New API endpoint to get sales by product description
 app.get("/api/product/by-description", async (req, res) => {
-  const { timePeriod, restaurantId, machineId, transactionType } = req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -536,8 +658,6 @@ app.get("/api/product/by-description", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -553,8 +673,18 @@ app.get("/api/product/by-description", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
@@ -579,8 +709,15 @@ app.get("/api/product/by-description", async (req, res) => {
 
 // New API endpoint to get sales by item family group
 app.get("/api/product/by-family-group", async (req, res) => {
-  const { timePeriod, restaurantId, productId, machineId, transactionType } =
-    req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -597,8 +734,6 @@ app.get("/api/product/by-family-group", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND di.item_family_group IS NOT NULL
@@ -619,8 +754,18 @@ app.get("/api/product/by-family-group", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
@@ -645,8 +790,15 @@ app.get("/api/product/by-family-group", async (req, res) => {
 
 // New API endpoint to get sales by item day part
 app.get("/api/product/by-day-part", async (req, res) => {
-  const { timePeriod, restaurantId, productId, machineId, transactionType } =
-    req.query;
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    pod,
+  } = req.query;
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -663,8 +815,6 @@ app.get("/api/product/by-day-part", async (req, res) => {
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
-        JOIN
-            dim_sale_type dst ON fs.sale_type = dst.sale_type
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND di.item_day_part IS NOT NULL
@@ -685,8 +835,18 @@ app.get("/api/product/by-day-part", async (req, res) => {
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND dst.sale_type = $${paramIndex++}`;
+    query += ` AND fs.sale_type = $${paramIndex++}`;
     queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    // New filter
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
   }
 
   query += `
@@ -709,18 +869,244 @@ app.get("/api/product/by-day-part", async (req, res) => {
   }
 });
 
-// API endpoint to get mock data for filter options
+// New API endpoint to get sales by Sale Type
+app.get("/api/sales/by-sale-type", async (req, res) => {
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    deliveryChannel,
+    pod,
+  } = req.query;
+  const { startDate, endDate } = getDateRange(timePeriod);
+
+  let query = `
+        SELECT
+            fs.sale_type AS name,
+            SUM(fs.total_amount) AS value
+        FROM
+            fact_sales fs
+        JOIN
+            dim_time dt ON fs.time_id = dt.time_id
+        JOIN
+            dim_store ds ON fs.store_id = ds.store_id
+        LEFT JOIN
+            dim_node dn ON fs.node_id = dn.node_id
+        JOIN
+            dim_item di ON fs.item_code = di.item_code
+        WHERE
+            dt.business_date >= $1 AND dt.business_date <= $2
+            AND fs.sale_type IS NOT NULL
+    `;
+  const queryParams = [startDate, endDate];
+  let paramIndex = 3;
+
+  if (restaurantId && restaurantId !== "all") {
+    query += ` AND ds.store_id = $${paramIndex++}`;
+    queryParams.push(restaurantId);
+  }
+  if (productId && productId !== "all") {
+    query += ` AND di.item_code = $${paramIndex++}`;
+    queryParams.push(productId);
+  }
+  if (machineId && machineId !== "all") {
+    query += ` AND dn.node_id = $${paramIndex++}`;
+    queryParams.push(machineId);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+  if (pod && pod !== "all") {
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
+  }
+
+  query += `
+        GROUP BY
+            fs.sale_type
+        ORDER BY
+            value DESC;
+    `;
+
+  try {
+    const { rows } = await pool.query(query, queryParams);
+    const formattedData = rows.map((row) => ({
+      name: row.name,
+      value: parseFloat(row.value || 0),
+    }));
+    res.json(formattedData);
+  } catch (err) {
+    console.error("Error fetching sales by sale type:", err.stack);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// New API endpoint to get sales by Delivery Channel
+app.get("/api/sales/by-delivery-channel", async (req, res) => {
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    pod,
+  } = req.query;
+  const { startDate, endDate } = getDateRange(timePeriod);
+
+  let query = `
+        SELECT
+            fs.delivery_channel AS name,
+            SUM(fs.total_amount) AS value
+        FROM
+            fact_sales fs
+        JOIN
+            dim_time dt ON fs.time_id = dt.time_id
+        JOIN
+            dim_store ds ON fs.store_id = ds.store_id
+        LEFT JOIN
+            dim_node dn ON fs.node_id = dn.node_id
+        JOIN
+            dim_item di ON fs.item_code = di.item_code
+        WHERE
+            dt.business_date >= $1 AND dt.business_date <= $2
+            AND fs.delivery_channel IS NOT NULL
+    `;
+  const queryParams = [startDate, endDate];
+  let paramIndex = 3;
+
+  if (restaurantId && restaurantId !== "all") {
+    query += ` AND ds.store_id = $${paramIndex++}`;
+    queryParams.push(restaurantId);
+  }
+  if (productId && productId !== "all") {
+    query += ` AND di.item_code = $${paramIndex++}`;
+    queryParams.push(productId);
+  }
+  if (machineId && machineId !== "all") {
+    query += ` AND dn.node_id = $${paramIndex++}`;
+    queryParams.push(machineId);
+  }
+  if (transactionType && transactionType !== "all") {
+    query += ` AND fs.sale_type = $${paramIndex++}`;
+    queryParams.push(transactionType);
+  }
+  if (pod && pod !== "all") {
+    query += ` AND fs.pod = $${paramIndex++}`;
+    queryParams.push(pod);
+  }
+
+  query += `
+        GROUP BY
+            fs.delivery_channel
+        ORDER BY
+            value DESC;
+    `;
+
+  try {
+    const { rows } = await pool.query(query, queryParams);
+    const formattedData = rows.map((row) => ({
+      name: row.name,
+      value: parseFloat(row.value || 0),
+    }));
+    res.json(formattedData);
+  } catch (err) {
+    console.error("Error fetching sales by delivery channel:", err.stack);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// New API endpoint to get sales by POD (Point of Distribution)
+app.get("/api/sales/by-pod", async (req, res) => {
+  const {
+    timePeriod,
+    restaurantId,
+    productId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+  } = req.query;
+  const { startDate, endDate } = getDateRange(timePeriod);
+
+  let query = `
+        SELECT
+            fs.pod AS name,
+            SUM(fs.total_amount) AS value
+        FROM
+            fact_sales fs
+        JOIN
+            dim_time dt ON fs.time_id = dt.time_id
+        JOIN
+            dim_store ds ON fs.store_id = ds.store_id
+        LEFT JOIN
+            dim_node dn ON fs.node_id = dn.node_id
+        JOIN
+            dim_item di ON fs.item_code = di.item_code
+        WHERE
+            dt.business_date >= $1 AND dt.business_date <= $2
+            AND fs.pod IS NOT NULL
+    `;
+  const queryParams = [startDate, endDate];
+  let paramIndex = 3;
+
+  if (restaurantId && restaurantId !== "all") {
+    query += ` AND ds.store_id = $${paramIndex++}`;
+    queryParams.push(restaurantId);
+  }
+  if (productId && productId !== "all") {
+    query += ` AND di.item_code = $${paramIndex++}`;
+    queryParams.push(productId);
+  }
+  if (machineId && machineId !== "all") {
+    query += ` AND dn.node_id = $${paramIndex++}`;
+    queryParams.push(machineId);
+  }
+  if (transactionType && transactionType !== "all") {
+    query += ` AND fs.sale_type = $${paramIndex++}`;
+    queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    queryParams.push(deliveryChannel);
+  }
+
+  query += `
+        GROUP BY
+            fs.pod
+        ORDER BY
+            value DESC;
+    `;
+
+  try {
+    const { rows } = await pool.query(query, queryParams);
+    const formattedData = rows.map((row) => ({
+      name: row.name,
+      value: parseFloat(row.value || 0),
+    }));
+    res.json(formattedData);
+  } catch (err) {
+    console.error("Error fetching sales by POD:", err.stack);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// API endpoint to get mock data for filter options (cached)
 app.get("/api/mock-data", async (req, res) => {
+  const cachedData = myCache.get("mockData");
+  if (cachedData) {
+    console.log("Serving mock data from cache");
+    return res.json(cachedData);
+  }
+
   try {
     // Fetch restaurants
-    // Changed 'store_name' to 'store_id' as 'store_name' column was reported as non-existent.
-    // If you have a different column for store names, please update 'store_id' to that column name.
     const { rows: restaurantRows } = await pool.query(
       "SELECT store_id FROM dim_store"
     );
     const restaurants = restaurantRows.map((row) => ({
       id: row.store_id,
-      name: row.store_id, // Using store_id as name for now
+      name: row.store_id, // Using store_id as name for now, update if store_name column exists
     }));
 
     // Fetch products
@@ -738,11 +1124,25 @@ app.get("/api/mock-data", async (req, res) => {
     );
     const machines = machineRows.map((row) => row.node_id);
 
-    // Fetch transaction types
+    // Fetch distinct transaction types
     const { rows: transactionTypeRows } = await pool.query(
-      "SELECT sale_type FROM dim_sale_type"
+      "SELECT DISTINCT sale_type FROM fact_sales WHERE sale_type IS NOT NULL"
     );
     const transactionTypes = transactionTypeRows.map((row) => row.sale_type);
+
+    // Fetch distinct delivery channels
+    const { rows: deliveryChannelRows } = await pool.query(
+      "SELECT DISTINCT delivery_channel FROM fact_sales WHERE delivery_channel IS NOT NULL"
+    );
+    const deliveryChannels = deliveryChannelRows.map(
+      (row) => row.delivery_channel
+    );
+
+    // Fetch distinct PODs
+    const { rows: podRows } = await pool.query(
+      "SELECT DISTINCT pod FROM fact_sales WHERE pod IS NOT NULL"
+    );
+    const pods = podRows.map((row) => row.pod);
 
     // Fetch distinct item_family_group
     const { rows: itemFamilyGroupRows } = await pool.query(
@@ -758,14 +1158,19 @@ app.get("/api/mock-data", async (req, res) => {
     );
     const itemDayParts = itemDayPartRows.map((row) => row.item_day_part);
 
-    res.json({
+    const dataToCache = {
       restaurants,
       products,
       machines,
       transactionTypes,
-      itemFamilyGroups, // Include new options
-      itemDayParts, // Include new options
-    });
+      deliveryChannels, // Include new options
+      pods, // Include new options
+      itemFamilyGroups,
+      itemDayParts,
+    };
+
+    myCache.set("mockData", dataToCache); // Cache the fetched data
+    res.json(dataToCache);
   } catch (err) {
     console.error("Error fetching mock data:", err.stack);
     res.status(500).json({ error: "Internal server error" });
@@ -773,6 +1178,7 @@ app.get("/api/mock-data", async (req, res) => {
 });
 
 // Start the server
-app.listen(port, () => {
-  console.log(`Backend server listening at http://localhost:${port}`);
+app.listen(port, "0.0.0.0", () => {
+  console.log(`Server running on:`);
+  console.log(`- Local:   http://localhost:${port}`);
 });
