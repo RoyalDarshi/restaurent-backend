@@ -109,12 +109,21 @@ app.get("/api/sales", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId, // This will be item_code for filtering
+    product, // This will be item_code for filtering
     machineId,
     transactionType,
     deliveryChannel, // New filter
     pod, // New filter
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
 
   let query = `
         SELECT
@@ -122,15 +131,20 @@ app.get("/api/sales", async (req, res) => {
             dt.business_date,
             ds.store_id AS restaurant_id,
             dn.node_id AS machine_id,
-            di.item_code AS product_id,
-            di.item_description AS product_name,
-            di.item_family_group,
-            di.item_day_part,
+            pm.productid AS product_id,
+            pm.productname AS product_name,
+            -- Removed hierarchical product columns as they cause 'column does not exist' error
+            -- pm.reporting_id_4,
+            -- pm.piecategory3,
+            -- pm.reporting_2,
+            -- pm.subcategory_1,
             fs.sale_type AS transaction_type,
             fs.delivery_channel, -- Include delivery_channel
             fs.pod, -- Include pod
             fs.total_amount,
-            fs.item_qty
+            fs.item_qty,
+            di.item_family_group, -- Include item_family_group
+            di.item_day_part -- Include item_day_part
         FROM
             fact_sales fs
         JOIN
@@ -140,7 +154,9 @@ app.get("/api/sales", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
+        JOIN
+            dim_item di ON fs.item_code = di.item_code -- Join dim_item for item_family_group and item_day_part
     `;
 
   const queryParams = [];
@@ -157,9 +173,10 @@ app.get("/api/sales", async (req, res) => {
     whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    whereConditions.push(`di.item_code = $${paramIndex++}`);
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     whereConditions.push(`dn.node_id = $${paramIndex++}`);
@@ -206,6 +223,11 @@ app.get("/api/sales", async (req, res) => {
         quantity: parseFloat(row.item_qty),
         itemFamilyGroup: row.item_family_group,
         itemDayPart: row.item_day_part,
+        // Removed assignments for hierarchical product columns
+        // reporting_id_4: row.reporting_id_4,
+        // piecategory3: row.piecategory3,
+        // reporting_2: row.reporting_2,
+        // subcategory_1: row.subcategory_1,
       };
     });
     res.json(formattedTransactions);
@@ -220,37 +242,49 @@ app.get("/api/sales/summary", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
-        SELECT
-            SUM(fs.total_amount) AS total_sales,
-            COUNT(DISTINCT fs.sales_id) AS total_orders,
-            COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
-            COUNT(DISTINCT fs.invoice_number) AS total_invoices
-        FROM
-            fact_sales fs
-        JOIN
-            dim_time dt ON fs.time_id = dt.time_id
-        JOIN
-            dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN -- Use LEFT JOIN for dim_node if it's not always present for all sales
-            dim_node dn ON fs.node_id = dn.node_id
-        JOIN
-            dim_item di ON fs.item_code = di.item_code
-    `;
+    SELECT
+      SUM(fs.total_amount) AS total_sales,
+      COUNT(DISTINCT fs.sales_id) AS total_orders,
+      COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
+      COUNT(DISTINCT fs.invoice_number) AS total_invoices
+    FROM
+      fact_sales fs
+    JOIN
+      dim_time dt ON fs.time_id = dt.time_id
+    JOIN
+      dim_store ds ON fs.store_id = ds.store_id
+    LEFT JOIN
+      dim_node dn ON fs.node_id = dn.node_id
+    JOIN
+      product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
+  `;
+
   const queryParams = [];
-  let whereConditions = [];
+  const whereConditions = [];
   let paramIndex = 1;
 
   whereConditions.push(`dt.business_date >= $${paramIndex++}`);
   queryParams.push(startDate);
+
   whereConditions.push(`dt.business_date <= $${paramIndex++}`);
   queryParams.push(endDate);
 
@@ -258,25 +292,29 @@ app.get("/api/sales/summary", async (req, res) => {
     whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    whereConditions.push(`di.item_code = $${paramIndex++}`);
-    queryParams.push(productId);
+
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
+    queryParams.push(productFilter.value);
   }
+
   if (machineId && machineId !== "all") {
     whereConditions.push(`dn.node_id = $${paramIndex++}`);
     queryParams.push(machineId);
   }
+
   if (transactionType && transactionType !== "all") {
     whereConditions.push(`fs.sale_type = $${paramIndex++}`);
     queryParams.push(transactionType);
   }
+
   if (deliveryChannel && deliveryChannel !== "all") {
-    // New filter
     whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
     queryParams.push(deliveryChannel);
   }
+
   if (pod && pod !== "all") {
-    // New filter
     whereConditions.push(`fs.pod = $${paramIndex++}`);
     queryParams.push(pod);
   }
@@ -284,6 +322,10 @@ app.get("/api/sales/summary", async (req, res) => {
   if (whereConditions.length > 0) {
     query += ` WHERE ` + whereConditions.join(" AND ");
   }
+
+  query += `;`;
+
+  console.log("Executing summary query:", query, queryParams);
 
   try {
     const { rows } = await pool.query(query, queryParams);
@@ -305,12 +347,22 @@ app.get("/api/sales/daily-trend", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -326,7 +378,7 @@ app.get("/api/sales/daily-trend", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
     `;
   const queryParams = [];
   let whereConditions = [];
@@ -341,9 +393,10 @@ app.get("/api/sales/daily-trend", async (req, res) => {
     whereConditions.push(`ds.store_id = $${paramIndex++}`);
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    whereConditions.push(`di.item_code = $${paramIndex++}`);
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     whereConditions.push(`dn.node_id = $${paramIndex++}`);
@@ -396,12 +449,22 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -417,7 +480,7 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -428,9 +491,10 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -485,12 +549,22 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
 app.get("/api/sales/by-restaurant", async (req, res) => {
   const {
     timePeriod,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query; // No restaurantId filter here
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -506,34 +580,40 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
   const queryParams = [startDate, endDate];
+  let whereConditions = []; // Initialize whereConditions
   let paramIndex = 3;
 
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`); // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndex++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
     // New filter
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
     queryParams.push(deliveryChannel);
   }
   if (pod && pod !== "all") {
     // New filter
-    query += ` AND fs.pod = $${paramIndex++}`;
+    whereConditions.push(`fs.pod = $${paramIndex++}`);
     queryParams.push(pod);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND "); // Changed from WHERE to AND
   }
 
   query += `
@@ -570,7 +650,7 @@ app.get("/api/sales/by-product", async (req, res) => {
 
   let query = `
         SELECT
-            di.item_description AS name,
+            pm.productname AS name, -- Changed from di.item_description to pm.productname
             SUM(fs.total_amount) AS value
         FROM
             fact_sales fs
@@ -581,18 +661,18 @@ app.get("/api/sales/by-product", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndex = 3; // This is the crucial part for filtering by restaurantId
 
-  // This is the crucial part for filtering by restaurantId
   if (restaurantId && restaurantId !== "all") {
     query += ` AND ds.store_id = $${paramIndex++}`; // Add restaurantId filter
     queryParams.push(restaurantId);
   }
+  // No product filter here as this is "Top Selling Products"
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
     queryParams.push(machineId);
@@ -614,7 +694,7 @@ app.get("/api/sales/by-product", async (req, res) => {
 
   query += `
         GROUP BY
-            di.item_description
+            pm.productname -- Changed from di.item_description to pm.productname
         ORDER BY
             value DESC
         LIMIT 5;
@@ -638,16 +718,27 @@ app.get("/api/product/by-description", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
         SELECT
-            di.item_description AS name,
+            pm.productname AS name, -- Changed from di.item_description to pm.productname
             SUM(fs.total_amount) AS value
         FROM
             fact_sales fs
@@ -658,7 +749,7 @@ app.get("/api/product/by-description", async (req, res) => {
         JOIN
             dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
     `;
@@ -668,6 +759,11 @@ app.get("/api/product/by-description", async (req, res) => {
   if (restaurantId && restaurantId !== "all") {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
+  }
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -690,7 +786,7 @@ app.get("/api/product/by-description", async (req, res) => {
 
   query += `
         GROUP BY
-            di.item_description
+            pm.productname -- Changed from di.item_description to pm.productname
         ORDER BY
             value DESC;
     `;
@@ -713,12 +809,22 @@ app.get("/api/product/by-family-group", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -731,10 +837,11 @@ app.get("/api/product/by-family-group", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN
-            dim_node dn ON fs.node_id = dn.node_id
+        LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
+        JOIN
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND di.item_family_group IS NOT NULL
@@ -746,9 +853,10 @@ app.get("/api/product/by-family-group", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -794,12 +902,22 @@ app.get("/api/product/by-day-part", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
     pod,
   } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -812,10 +930,11 @@ app.get("/api/product/by-day-part", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN
-            dim_node dn ON fs.node_id = dn.node_id
+        LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
         JOIN
             dim_item di ON fs.item_code = di.item_code
+        JOIN
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND di.item_day_part IS NOT NULL
@@ -827,9 +946,10 @@ app.get("/api/product/by-day-part", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -870,16 +990,26 @@ app.get("/api/product/by-day-part", async (req, res) => {
   }
 });
 
-// New API endpoint to get sales by Sale Type
+// New API endpoint to get sales by transaction type
 app.get("/api/sales/by-sale-type", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     deliveryChannel,
     pod,
-  } = req.query;
+  } = req.query; // No transactionType filter here
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -892,10 +1022,9 @@ app.get("/api/sales/by-sale-type", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN
-            dim_node dn ON fs.node_id = dn.node_id
+        LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND fs.sale_type IS NOT NULL
@@ -907,19 +1036,22 @@ app.get("/api/sales/by-sale-type", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
     queryParams.push(machineId);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
     query += ` AND fs.delivery_channel = $${paramIndex++}`;
     queryParams.push(deliveryChannel);
   }
   if (pod && pod !== "all") {
+    // New filter
     query += ` AND fs.pod = $${paramIndex++}`;
     queryParams.push(pod);
   }
@@ -944,16 +1076,26 @@ app.get("/api/sales/by-sale-type", async (req, res) => {
   }
 });
 
-// New API endpoint to get sales by Delivery Channel
+// New API endpoint to get sales by delivery channel
 app.get("/api/sales/by-delivery-channel", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     pod,
-  } = req.query;
+  } = req.query; // No deliveryChannel filter here
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -966,10 +1108,9 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN
-            dim_node dn ON fs.node_id = dn.node_id
+        LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND fs.delivery_channel IS NOT NULL
@@ -981,9 +1122,10 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -994,6 +1136,7 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
     queryParams.push(transactionType);
   }
   if (pod && pod !== "all") {
+    // New filter
     query += ` AND fs.pod = $${paramIndex++}`;
     queryParams.push(pod);
   }
@@ -1018,16 +1161,26 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
   }
 });
 
-// New API endpoint to get sales by POD (Point of Distribution)
+// New API endpoint to get sales by POD
 app.get("/api/sales/by-pod", async (req, res) => {
   const {
     timePeriod,
     restaurantId,
-    productId,
+    product, // Changed from productId to product
     machineId,
     transactionType,
     deliveryChannel,
-  } = req.query;
+  } = req.query; // No pod filter here
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
+
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
@@ -1040,10 +1193,9 @@ app.get("/api/sales/by-pod", async (req, res) => {
             dim_time dt ON fs.time_id = dt.time_id
         JOIN
             dim_store ds ON fs.store_id = ds.store_id
-        LEFT JOIN
-            dim_node dn ON fs.node_id = dn.node_id
+        LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
         JOIN
-            dim_item di ON fs.item_code = di.item_code
+            product_master pm ON fs.item_code = pm.productid::TEXT -- Cast productid to TEXT
         WHERE
             dt.business_date >= $1 AND dt.business_date <= $2
             AND fs.pod IS NOT NULL
@@ -1055,9 +1207,10 @@ app.get("/api/sales/by-pod", async (req, res) => {
     query += ` AND ds.store_id = $${paramIndex++}`;
     queryParams.push(restaurantId);
   }
-  if (productId && productId !== "all") {
-    query += ` AND di.item_code = $${paramIndex++}`;
-    queryParams.push(productId);
+  // Explicitly cast the column to TEXT for comparison
+  if (productFilter && productFilter.type && productFilter.value) {
+    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`; // Use pm for product filters
+    queryParams.push(productFilter.value);
   }
   if (machineId && machineId !== "all") {
     query += ` AND dn.node_id = $${paramIndex++}`;
@@ -1068,6 +1221,7 @@ app.get("/api/sales/by-pod", async (req, res) => {
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
+    // New filter
     query += ` AND fs.delivery_channel = $${paramIndex++}`;
     queryParams.push(deliveryChannel);
   }
@@ -1087,43 +1241,163 @@ app.get("/api/sales/by-pod", async (req, res) => {
     }));
     res.json(formattedData);
   } catch (err) {
-    console.error("Error fetching sales by POD:", err.stack);
+    console.error("Error fetching sales by pod:", err.stack);
     res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// API endpoint to get mock data for filter options (cached)
+// API endpoint to get distinct values for filters (restaurants, products, machines, transaction types)
 app.get("/api/mock-data", async (req, res) => {
   const cachedData = myCache.get("mockData");
   if (cachedData) {
-    console.log("Serving mock data from cache");
     return res.json(cachedData);
   }
 
   try {
-    // Fetch restaurants
+    // Fetch distinct restaurants
     const { rows: restaurantRows } = await pool.query(
-      "SELECT store_id FROM dim_store"
+      "SELECT DISTINCT store_id AS id, store_id AS name FROM dim_store ORDER BY name"
     );
     const restaurants = restaurantRows.map((row) => ({
-      id: row.store_id,
-      name: row.store_id, // Using store_id as name for now, update if store_name column exists
+      id: row.id,
+      name: row.name,
     }));
 
-    // Fetch products
-    const { rows: productRows } = await pool.query(
-      "SELECT item_code, item_description FROM dim_item"
-    );
-    const products = productRows.map((row) => ({
-      id: row.item_code,
-      name: row.item_description,
+    // Fetch distinct products and product hierarchy info
+    const { rows: productRows } = await pool.query(`
+        SELECT
+            productid,
+            productname,
+            subcategory_1,
+            reporting_2,
+            piecategory_3,
+            reporting_id_4
+        FROM
+            product_master
+    `);
+
+    // Construct nested product hierarchy (kept for potential future use or other views)
+    const productHierarchyMap = new Map();
+
+    productRows.forEach((row) => {
+      const {
+        subcategory_1,
+        reporting_2,
+        piecategory_3,
+        reporting_id_4,
+        productname,
+      } = row;
+
+      if (
+        !subcategory_1 ||
+        !reporting_2 ||
+        !piecategory_3 ||
+        !reporting_id_4 ||
+        !productname
+      ) {
+        return; // skip incomplete data
+      }
+
+      // Subcategory Level
+      if (!productHierarchyMap.has(subcategory_1)) {
+        productHierarchyMap.set(subcategory_1, {
+          name: subcategory_1,
+          type: "subcategory_1",
+          children: [],
+        });
+      }
+      const subcategoryNode = productHierarchyMap.get(subcategory_1);
+
+      // Reporting 2 Level
+      let reporting2Node = subcategoryNode.children.find(
+        (child) => child.name === reporting_2
+      );
+      if (!reporting2Node) {
+        reporting2Node = {
+          name: reporting_2,
+          type: "reporting_2",
+          children: [],
+        };
+        subcategoryNode.children.push(reporting2Node);
+      }
+
+      // Piecategory 3 Level
+      let piecategory3Node = reporting2Node.children.find(
+        (child) => child.name === piecategory_3
+      );
+      if (!piecategory3Node) {
+        piecategory3Node = {
+          name: piecategory_3,
+          type: "piecategory_3",
+          children: [],
+        };
+        reporting2Node.children.push(piecategory3Node);
+      }
+
+      // Reporting ID 4 Level
+      let reportingId4Node = piecategory3Node.children.find(
+        (child) => child.name === reporting_id_4
+      );
+      if (!reportingId4Node) {
+        reportingId4Node = {
+          name: reporting_id_4,
+          type: "reporting_id_4",
+          children: [],
+        };
+        piecategory3Node.children.push(reportingId4Node);
+      }
+
+      // Product Name Level
+      reportingId4Node.children.push({
+        name: productname,
+        type: "productname",
+        id: row.productid, // Add productid here for frontend filtering
+      });
+    });
+
+    // Convert Map to Array
+    const products = Array.from(productHierarchyMap.values());
+
+    // Extract unique hierarchy values for filters (these are used by ProductFilter)
+    const subcategory1Options = [
+      ...new Set(productRows.map((row) => row.subcategory_1)),
+    ]
+      .filter(Boolean)
+      .map((item) => ({ id: item, name: item }));
+    const reporting2Options = [
+      ...new Set(productRows.map((row) => row.reporting_2)),
+    ]
+      .filter(Boolean)
+      .map((item) => ({ id: item, name: item }));
+    const piecategory3Options = [
+      ...new Set(productRows.map((row) => row.piecategory_3)),
+    ]
+      .filter(Boolean)
+      .map((item) => ({ id: item, name: item }));
+    const reportingId4Options = [
+      ...new Set(productRows.map((row) => row.reporting_id_4)),
+    ]
+      .filter(Boolean)
+      .map((item) => ({ id: item, name: item }));
+
+    // NEW: Flat product data for ProductFilter component to easily iterate and filter
+    const allProductsFlat = productRows.map((row) => ({
+      id: row.productid,
+      name: row.productname,
+      subcategory_1: row.subcategory_1,
+      reporting_2: row.reporting_2,
+      piecategory_3: row.piecategory_3,
+      reporting_id_4: row.reporting_id_4,
     }));
 
-    // Fetch machines
+    // Fetch distinct machines
     const { rows: machineRows } = await pool.query(
-      "SELECT node_id FROM dim_node"
+      "SELECT DISTINCT node_id AS id, node_id AS name FROM dim_node ORDER BY name"
     );
-    const machines = machineRows.map((row) => row.node_id);
+    const machines = machineRows.map((row) => ({
+      id: row.id,
+      name: row.name,
+    }));
 
     // Fetch distinct transaction types
     const { rows: transactionTypeRows } = await pool.query(
@@ -1161,13 +1435,18 @@ app.get("/api/mock-data", async (req, res) => {
 
     const dataToCache = {
       restaurants,
-      products,
+      products, // Keep this if needed for other purposes, though ProductFilter uses allProductsFlat
       machines,
       transactionTypes,
-      deliveryChannels, // Include new options
-      pods, // Include new options
+      deliveryChannels,
+      pods,
       itemFamilyGroups,
       itemDayParts,
+      subcategory1Options,
+      reporting2Options,
+      piecategory3Options,
+      reportingId4Options,
+      allProductsFlat, // NEW: Add flat product data for filtering
     };
 
     myCache.set("mockData", dataToCache); // Cache the fetched data
@@ -1178,8 +1457,6 @@ app.get("/api/mock-data", async (req, res) => {
   }
 });
 
-// Start the server
-app.listen(port, "0.0.0.0", () => {
-  console.log(`Server running on:`);
-  console.log(`- Local:   http://localhost:${port}`);
+app.listen(port, () => {
+  console.log(`Server running on port ${port}`);
 });
