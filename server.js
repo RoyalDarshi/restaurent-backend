@@ -102,7 +102,8 @@ const addCommonWhereConditions = (
   whereConditions,
   queryParams,
   reqQuery,
-  paramIndexRef
+  paramIndexRef,
+  excludeOcOm = false // New parameter to exclude OC/OM filters
 ) => {
   const {
     timePeriod,
@@ -112,8 +113,8 @@ const addCommonWhereConditions = (
     transactionType,
     deliveryChannel,
     store,
-    ocEmailId, // New filter
-    omEmailId, // New filter
+    ocEmailId,
+    omEmailId,
   } = reqQuery;
 
   const { startDate, endDate } = getDateRange(timePeriod);
@@ -175,14 +176,17 @@ const addCommonWhereConditions = (
     whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  // New OC and OM filters
-  if (ocEmailId && ocEmailId !== "all") {
-    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
-    queryParams.push(ocEmailId);
-  }
-  if (omEmailId && omEmailId !== "all") {
-    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
-    queryParams.push(omEmailId);
+
+  // Apply OC and OM filters only if not excluded and not "all"
+  if (!excludeOcOm) {
+    if (ocEmailId && ocEmailId !== "all") {
+      whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+      queryParams.push(ocEmailId);
+    }
+    if (omEmailId && omEmailId !== "all") {
+      whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+      queryParams.push(omEmailId);
+    }
   }
 };
 
@@ -1334,27 +1338,15 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
   }
 });
 
-// Removed the /api/sales/by-pod endpoint
-
 // New API endpoint for sales summary by store, filtered by OC/OM
 app.get("/api/sales/by-oc-om-store-summary", async (req, res) => {
-  const {
-    timePeriod,
-    ocEmailId,
-    omEmailId,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    store,
-  } = req.query;
+  const { timePeriod } = req.query;
 
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
     SELECT
-      ds.store_id AS store_name,
+      sm.storename AS store_name,
       SUM(fs.total_amount) AS total_sales,
       COUNT(DISTINCT fs.sales_id) AS total_orders,
       COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
@@ -1378,23 +1370,13 @@ app.get("/api/sales/by-oc-om-store-summary", async (req, res) => {
     paramIndexRef
   );
 
-  // Specific filter for ocEmailId or omEmailId
-  if (ocEmailId && ocEmailId !== "all") {
-    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
-    queryParams.push(ocEmailId);
-  }
-  if (omEmailId && omEmailId !== "all") {
-    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
-    queryParams.push(omEmailId);
-  }
-
   if (whereConditions.length > 0) {
     query += ` WHERE ` + whereConditions.join(" AND ");
   }
 
   query += `
-    GROUP BY ds.store_id
-    ORDER BY ds.store_id;
+    GROUP BY sm.storename
+    ORDER BY sm.storename;
   `;
 
   try {
@@ -1412,6 +1394,128 @@ app.get("/api/sales/by-oc-om-store-summary", async (req, res) => {
       "Error fetching sales by OC/OM and store summary:",
       err.stack
     );
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// New API endpoint for sales by OC
+app.get("/api/sales/by-oc", async (req, res) => {
+  const { timePeriod } = req.query;
+  const { startDate, endDate } = getDateRange(timePeriod);
+
+  let query = `
+    SELECT
+      sm.ocemailid AS email,
+      sm.oc AS name,
+      SUM(fs.total_amount) AS total_sales,
+      COUNT(DISTINCT fs.sales_id) AS total_orders,
+      COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
+      COUNT(DISTINCT fs.invoice_number) AS total_invoices
+    FROM fact_sales fs
+    JOIN dim_time dt ON fs.time_id = dt.time_id
+    JOIN dim_store ds ON fs.store_id = ds.store_id
+    LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
+    JOIN product_master pm ON fs.item_code = pm.productid::TEXT
+    LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
+    WHERE dt.business_date >= $1 AND dt.business_date <= $2 AND sm.ocemailid IS NOT NULL
+  `;
+
+  const queryParams = [startDate, endDate];
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
+
+  // Add common conditions, excluding OC/OM specific filters
+  addCommonWhereConditions(
+    whereConditions,
+    queryParams,
+    req.query,
+    paramIndexRef,
+    true // Exclude OC/OM filters
+  );
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
+  }
+
+  query += `
+    GROUP BY sm.ocemailid, sm.oc
+    ORDER BY total_sales DESC;
+  `;
+
+  try {
+    const { rows } = await pool.query(query, queryParams);
+    const formattedData = rows.map((row) => ({
+      email: row.email,
+      name: row.name || row.email, // Fallback to email if name is null
+      totalSales: parseFloat(row.total_sales || 0),
+      totalOrders: parseInt(row.total_orders || 0),
+      avgOrderValue: parseFloat(row.avg_order_value || 0),
+      totalInvoices: parseInt(row.total_invoices || 0),
+    }));
+    res.json(formattedData);
+  } catch (err) {
+    console.error("Error fetching sales by OC:", err.stack);
+    res.status(500).json({ error: "Internal server error" });
+  }
+});
+
+// New API endpoint for sales by OM
+app.get("/api/sales/by-om", async (req, res) => {
+  const { timePeriod } = req.query;
+  const { startDate, endDate } = getDateRange(timePeriod);
+
+  let query = `
+    SELECT
+      sm.omemailid AS email,
+      sm.om AS name,
+      SUM(fs.total_amount) AS total_sales,
+      COUNT(DISTINCT fs.sales_id) AS total_orders,
+      COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
+      COUNT(DISTINCT fs.invoice_number) AS total_invoices
+    FROM fact_sales fs
+    JOIN dim_time dt ON fs.time_id = dt.time_id
+    JOIN dim_store ds ON fs.store_id = ds.store_id
+    LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
+    JOIN product_master pm ON fs.item_code = pm.productid::TEXT
+    LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
+    WHERE dt.business_date >= $1 AND dt.business_date <= $2 AND sm.omemailid IS NOT NULL
+  `;
+
+  const queryParams = [startDate, endDate];
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
+
+  // Add common conditions, excluding OC/OM specific filters
+  addCommonWhereConditions(
+    whereConditions,
+    queryParams,
+    req.query,
+    paramIndexRef,
+    true // Exclude OC/OM filters
+  );
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
+  }
+
+  query += `
+    GROUP BY sm.omemailid, sm.om
+    ORDER BY total_sales DESC;
+  `;
+
+  try {
+    const { rows } = await pool.query(query, queryParams);
+    const formattedData = rows.map((row) => ({
+      email: row.email,
+      name: row.name || row.email, // Fallback to email if name is null
+      totalSales: parseFloat(row.total_sales || 0),
+      totalOrders: parseInt(row.total_orders || 0),
+      avgOrderValue: parseFloat(row.avg_order_value || 0),
+      totalInvoices: parseInt(row.total_invoices || 0),
+    }));
+    res.json(formattedData);
+  } catch (err) {
+    console.error("Error fetching sales by OM:", err.stack);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1483,15 +1587,23 @@ app.get("/api/mock-data", async (req, res) => {
       (row) => row.delivery_channel
     );
 
-    const { rows: ocEmailIdRows } = await pool.query(
-      "SELECT DISTINCT ocemailid FROM store_master WHERE ocemailid IS NOT NULL ORDER BY ocemailid"
+    // Fetch OC email and name
+    const { rows: ocRows } = await pool.query(
+      "SELECT DISTINCT ocemailid, oc FROM store_master WHERE ocemailid IS NOT NULL ORDER BY ocemailid"
     );
-    const ocEmailIds = ocEmailIdRows.map((row) => row.ocemailid);
+    const ocEmailIds = ocRows.map((row) => ({
+      email: row.ocemailid,
+      name: row.oc || row.ocemailid, // Fallback to email if name is null
+    }));
 
-    const { rows: omEmailIdRows } = await pool.query(
-      "SELECT DISTINCT omemailid FROM store_master WHERE omemailid IS NOT NULL ORDER BY omemailid"
+    // Fetch OM email and name
+    const { rows: omRows } = await pool.query(
+      "SELECT DISTINCT omemailid, om FROM store_master WHERE omemailid IS NOT NULL ORDER BY omemailid"
     );
-    const omEmailIds = omEmailIdRows.map((row) => row.omemailid);
+    const omEmailIds = omRows.map((row) => ({
+      email: row.omemailid,
+      name: row.om || row.omemailid, // Fallback to email if name is null
+    }));
 
     const dataToCache = {
       restaurants,
@@ -1500,8 +1612,8 @@ app.get("/api/mock-data", async (req, res) => {
       machines,
       transactionTypes,
       deliveryChannels,
-      ocEmailIds, // Added OC emails to cache
-      omEmailIds, // Added OM emails to cache
+      ocEmailIds,
+      omEmailIds,
     };
 
     myCache.set("mockData", dataToCache);
