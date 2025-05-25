@@ -97,7 +97,13 @@ const getDateRange = (timePeriod) => {
   };
 };
 
-app.get("/api/sales", async (req, res) => {
+// Helper function to add common WHERE conditions
+const addCommonWhereConditions = (
+  whereConditions,
+  queryParams,
+  reqQuery,
+  paramIndexRef
+) => {
   const {
     timePeriod,
     restaurantId,
@@ -105,9 +111,21 @@ app.get("/api/sales", async (req, res) => {
     machineId,
     transactionType,
     deliveryChannel,
-    pod,
     store,
-  } = req.query;
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = reqQuery;
+
+  const { startDate, endDate } = getDateRange(timePeriod);
+  whereConditions.push(`dt.business_date >= $${paramIndexRef.current++}`);
+  queryParams.push(startDate);
+  whereConditions.push(`dt.business_date <= $${paramIndexRef.current++}`);
+  queryParams.push(endDate);
+
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
 
   let productFilter = null;
   if (product) {
@@ -116,6 +134,12 @@ app.get("/api/sales", async (req, res) => {
     } catch (e) {
       console.error("Error parsing product filter:", e);
     }
+  }
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
+    queryParams.push(productFilter.value);
   }
 
   let storeFilter = null;
@@ -126,7 +150,43 @@ app.get("/api/sales", async (req, res) => {
       console.error("Error parsing store filter:", e);
     }
   }
+  if (storeFilter && storeFilter.type && storeFilter.value) {
+    if (storeFilter.type === "state") {
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
+      queryParams.push(storeFilter.value);
+    } else if (storeFilter.type === "city") {
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
+      queryParams.push(storeFilter.value);
+    } else if (storeFilter.type === "storecode") {
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+      queryParams.push(storeFilter.value);
+    }
+  }
 
+  if (machineId && machineId !== "all") {
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
+    queryParams.push(machineId);
+  }
+  if (transactionType && transactionType !== "all") {
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
+    queryParams.push(transactionType);
+  }
+  if (deliveryChannel && deliveryChannel !== "all") {
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
+    queryParams.push(deliveryChannel);
+  }
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+};
+
+app.get("/api/sales", async (req, res) => {
   let query = `
     SELECT
       fs.sales_id,
@@ -153,53 +213,14 @@ app.get("/api/sales", async (req, res) => {
 
   const queryParams = [];
   let whereConditions = [];
-  let paramIndex = 1;
+  let paramIndexRef = { current: 1 };
 
-  const { startDate, endDate } = getDateRange(timePeriod);
-  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
-  queryParams.push(startDate);
-  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
-  queryParams.push(endDate);
-
-  if (restaurantId && restaurantId !== "all") {
-    whereConditions.push(`ds.store_id = $${paramIndex++}`);
-    queryParams.push(restaurantId);
-  }
-
-  if (productFilter && productFilter.type && productFilter.value) {
-    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
-    queryParams.push(productFilter.value);
-  }
-
-  if (storeFilter && storeFilter.type && storeFilter.value) {
-    if (storeFilter.type === "state") {
-      whereConditions.push(`sm.state = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "city") {
-      whereConditions.push(`sm.city = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "storecode") {
-      whereConditions.push(`ds.store_id = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    }
-  }
-
-  if (machineId && machineId !== "all") {
-    whereConditions.push(`dn.node_id = $${paramIndex++}`);
-    queryParams.push(machineId);
-  }
-  if (transactionType && transactionType !== "all") {
-    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
-    queryParams.push(transactionType);
-  }
-  if (deliveryChannel && deliveryChannel !== "all") {
-    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
-    queryParams.push(deliveryChannel);
-  }
-  if (pod && pod !== "all") {
-    whereConditions.push(`fs.pod = $${paramIndex++}`);
-    queryParams.push(pod);
-  }
+  addCommonWhereConditions(
+    whereConditions,
+    queryParams,
+    req.query,
+    paramIndexRef
+  );
 
   if (whereConditions.length > 0) {
     query += ` WHERE ` + whereConditions.join(" AND ");
@@ -219,7 +240,7 @@ app.get("/api/sales", async (req, res) => {
         machineId: row.machine_id,
         transactionType: row.transaction_type,
         deliveryChannel: row.delivery_channel,
-        pod: row.pod,
+        pod: row.pod, // Keeping pod for now in Transaction interface
         timestamp: datePart.getTime(),
         amount: parseFloat(row.total_amount),
         quantity: parseFloat(row.item_qty),
@@ -235,37 +256,6 @@ app.get("/api/sales", async (req, res) => {
 });
 
 app.get("/api/sales/summary", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
-
   let query = `
     SELECT
       SUM(fs.total_amount) AS total_sales,
@@ -282,52 +272,14 @@ app.get("/api/sales/summary", async (req, res) => {
 
   const queryParams = [];
   const whereConditions = [];
-  let paramIndex = 1;
+  let paramIndexRef = { current: 1 };
 
-  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
-  queryParams.push(startDate);
-  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
-  queryParams.push(endDate);
-
-  if (restaurantId && restaurantId !== "all") {
-    whereConditions.push(`ds.store_id = $${paramIndex++}`);
-    queryParams.push(restaurantId);
-  }
-
-  if (productFilter && productFilter.type && productFilter.value) {
-    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
-    queryParams.push(productFilter.value);
-  }
-
-  if (storeFilter && storeFilter.type && storeFilter.value) {
-    if (storeFilter.type === "state") {
-      whereConditions.push(`sm.state = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "city") {
-      whereConditions.push(`sm.city = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "storecode") {
-      whereConditions.push(`ds.store_id = $${paramIndex++}`);
-      queryParams.push(storeFilter.value);
-    }
-  }
-
-  if (machineId && machineId !== "all") {
-    whereConditions.push(`dn.node_id = $${paramIndex++}`);
-    queryParams.push(machineId);
-  }
-  if (transactionType && transactionType !== "all") {
-    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
-    queryParams.push(transactionType);
-  }
-  if (deliveryChannel && deliveryChannel !== "all") {
-    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
-    queryParams.push(deliveryChannel);
-  }
-  if (pod && pod !== "all") {
-    whereConditions.push(`fs.pod = $${paramIndex++}`);
-    queryParams.push(pod);
-  }
+  addCommonWhereConditions(
+    whereConditions,
+    queryParams,
+    req.query,
+    paramIndexRef
+  );
 
   if (whereConditions.length > 0) {
     query += ` WHERE ` + whereConditions.join(" AND ");
@@ -349,36 +301,7 @@ app.get("/api/sales/summary", async (req, res) => {
 });
 
 app.get("/api/sales/daily-trend", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -390,59 +313,90 @@ app.get("/api/sales/daily-trend", async (req, res) => {
     JOIN dim_node dn ON fs.node_id = dn.node_id
     JOIN product_master pm ON fs.item_code = pm.productid::TEXT
     LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
+    WHERE dt.business_date >= $1 AND dt.business_date <= $2
   `;
 
-  const queryParams = [];
-  let whereConditions = [];
-  let paramIndex = 1;
+  const queryParams = [startDate, endDate];
+  let paramIndexRef = { current: 3 }; // Start index after initial date params
+  const whereConditions = []; // Use this for additional conditions
 
-  whereConditions.push(`dt.business_date >= $${paramIndex++}`);
-  queryParams.push(startDate);
-  whereConditions.push(`dt.business_date <= $${paramIndex++}`);
-  queryParams.push(endDate);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
 
-  if (restaurantId && restaurantId !== "all") {
-    whereConditions.push(`ds.store_id = $${paramIndex++}`);
-    queryParams.push(restaurantId);
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    whereConditions.push(`pm.${productFilter.type}::TEXT = $${paramIndex++}`);
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      whereConditions.push(`sm.state = $${paramIndex++}`);
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      whereConditions.push(`sm.city = $${paramIndex++}`);
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      whereConditions.push(`ds.store_id = $${paramIndex++}`);
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    whereConditions.push(`dn.node_id = $${paramIndex++}`);
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    whereConditions.push(`fs.sale_type = $${paramIndex++}`);
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    whereConditions.push(`fs.delivery_channel = $${paramIndex++}`);
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    whereConditions.push(`fs.pod = $${paramIndex++}`);
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
   }
 
+  // Append additional WHERE conditions if any
   if (whereConditions.length > 0) {
-    query += ` WHERE ` + whereConditions.join(" AND ");
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -467,15 +421,35 @@ app.get("/api/sales/daily-trend", async (req, res) => {
 });
 
 app.get("/api/sales/hourly-trend", async (req, res) => {
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
+
+  let query = `
+    SELECT
+      dt.hour AS hour,
+      SUM(fs.total_amount) AS sales
+    FROM fact_sales fs
+    JOIN dim_time dt ON fs.time_id = dt.time_id
+    JOIN dim_store ds ON fs.store_id = ds.store_id
+    LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
+    JOIN product_master pm ON fs.item_code = pm.productid::TEXT
+    LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
+    WHERE dt.business_date >= $1 AND dt.business_date <= $2
+  `;
+
+  const queryParams = [startDate, endDate];
+  let paramIndexRef = { current: 3 }; // Start index after initial date params
+  const whereConditions = []; // Use this for additional conditions
+
+  // Extract parameters from req.query and add them to whereConditions and queryParams
   const {
-    timePeriod,
     restaurantId,
     product,
     machineId,
     transactionType,
     deliveryChannel,
-    pod,
     store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
   } = req.query;
 
   let productFilter = null;
@@ -486,6 +460,12 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
       console.error("Error parsing product filter:", e);
     }
   }
+  if (productFilter && productFilter.type && productFilter.value) {
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
+    queryParams.push(productFilter.value);
+  }
 
   let storeFilter = null;
   if (store) {
@@ -495,63 +475,48 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
       console.error("Error parsing store filter:", e);
     }
   }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
-
-  let query = `
-    SELECT
-      dt.hour AS hour,
-      SUM(fs.total_amount) AS sales
-    FROM fact_sales fs
-    JOIN dim_time dt ON fs.time_id = dt.time_id
-    JOIN dim_store ds ON fs.store_id = ds.store_id
-    JOIN dim_node dn ON fs.node_id = dn.node_id
-    JOIN product_master pm ON fs.item_code = pm.productid::TEXT
-    LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
-    WHERE dt.business_date >= $1 AND dt.business_date <= $2
-  `;
-
-  const queryParams = [startDate, endDate];
-  let paramIndex = 3;
-
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
-  }
-
-  if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
-    queryParams.push(productFilter.value);
-  }
-
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  // Append additional WHERE conditions if any
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -582,35 +547,7 @@ app.get("/api/sales/hourly-trend", async (req, res) => {
 });
 
 app.get("/api/sales/by-restaurant", async (req, res) => {
-  const {
-    timePeriod,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -626,41 +563,80 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    product,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
+  }
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -682,26 +658,7 @@ app.get("/api/sales/by-restaurant", async (req, res) => {
 });
 
 app.get("/api/sales/by-product", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -717,41 +674,69 @@ app.get("/api/sales/by-product", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
   }
-
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -774,36 +759,7 @@ app.get("/api/sales/by-product", async (req, res) => {
 });
 
 app.get("/api/product/by-description", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -819,46 +775,85 @@ app.get("/api/product/by-description", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -880,36 +875,7 @@ app.get("/api/product/by-description", async (req, res) => {
 });
 
 app.get("/api/product/by-family-group", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -927,46 +893,85 @@ app.get("/api/product/by-family-group", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -988,36 +993,7 @@ app.get("/api/product/by-family-group", async (req, res) => {
 });
 
 app.get("/api/product/by-day-part", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -1035,46 +1011,85 @@ app.get("/api/product/by-day-part", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    transactionType,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -1096,35 +1111,7 @@ app.get("/api/product/by-day-part", async (req, res) => {
 });
 
 app.get("/api/sales/by-sale-type", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    deliveryChannel,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -1141,42 +1128,80 @@ app.get("/api/sales/by-sale-type", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    deliveryChannel,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
+    whereConditions.push(`fs.delivery_channel = $${paramIndexRef.current++}`);
     queryParams.push(deliveryChannel);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -1198,35 +1223,7 @@ app.get("/api/sales/by-sale-type", async (req, res) => {
 });
 
 app.get("/api/sales/by-delivery-channel", async (req, res) => {
-  const {
-    timePeriod,
-    restaurantId,
-    product,
-    machineId,
-    transactionType,
-    pod,
-    store,
-  } = req.query;
-
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
-  const { startDate, endDate } = getDateRange(timePeriod);
+  const { startDate, endDate } = getDateRange(req.query.timePeriod);
 
   let query = `
     SELECT
@@ -1243,42 +1240,80 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
   `;
 
   const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  let paramIndexRef = { current: 3 };
+  const whereConditions = [];
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  // Extract parameters from req.query and add them to whereConditions and queryParams
+  const {
+    restaurantId,
+    product,
+    machineId,
+    transactionType,
+    store,
+    ocEmailId, // New filter
+    omEmailId, // New filter
+  } = req.query;
+
+  let productFilter = null;
+  if (product) {
+    try {
+      productFilter = JSON.parse(product);
+    } catch (e) {
+      console.error("Error parsing product filter:", e);
+    }
   }
-
   if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
+    whereConditions.push(
+      `pm.${productFilter.type}::TEXT = $${paramIndexRef.current++}`
+    );
     queryParams.push(productFilter.value);
   }
 
+  let storeFilter = null;
+  if (store) {
+    try {
+      storeFilter = JSON.parse(store);
+    } catch (e) {
+      console.error("Error parsing store filter:", e);
+    }
+  }
   if (storeFilter && storeFilter.type && storeFilter.value) {
     if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
+      whereConditions.push(`sm.state = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
+      whereConditions.push(`sm.city = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
+      whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
       queryParams.push(storeFilter.value);
     }
   }
 
+  if (restaurantId && restaurantId !== "all") {
+    whereConditions.push(`ds.store_id = $${paramIndexRef.current++}`);
+    queryParams.push(restaurantId);
+  }
   if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
+    whereConditions.push(`dn.node_id = $${paramIndexRef.current++}`);
     queryParams.push(machineId);
   }
   if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
+    whereConditions.push(`fs.sale_type = $${paramIndexRef.current++}`);
     queryParams.push(transactionType);
   }
-  if (pod && pod !== "all") {
-    query += ` AND fs.pod = $${paramIndex++}`;
-    queryParams.push(pod);
+  // New OC and OM filters
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
+  }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
+  }
+
+  if (whereConditions.length > 0) {
+    query += ` AND ` + whereConditions.join(" AND ");
   }
 
   query += `
@@ -1299,9 +1334,14 @@ app.get("/api/sales/by-delivery-channel", async (req, res) => {
   }
 });
 
-app.get("/api/sales/by-pod", async (req, res) => {
+// Removed the /api/sales/by-pod endpoint
+
+// New API endpoint for sales summary by store, filtered by OC/OM
+app.get("/api/sales/by-oc-om-store-summary", async (req, res) => {
   const {
     timePeriod,
+    ocEmailId,
+    omEmailId,
     restaurantId,
     product,
     machineId,
@@ -1310,93 +1350,68 @@ app.get("/api/sales/by-pod", async (req, res) => {
     store,
   } = req.query;
 
-  let productFilter = null;
-  if (product) {
-    try {
-      productFilter = JSON.parse(product);
-    } catch (e) {
-      console.error("Error parsing product filter:", e);
-    }
-  }
-
-  let storeFilter = null;
-  if (store) {
-    try {
-      storeFilter = JSON.parse(store);
-    } catch (e) {
-      console.error("Error parsing store filter:", e);
-    }
-  }
-
   const { startDate, endDate } = getDateRange(timePeriod);
 
   let query = `
     SELECT
-      fs.pod AS name,
-      SUM(fs.total_amount) AS value
+      ds.store_id AS store_name,
+      SUM(fs.total_amount) AS total_sales,
+      COUNT(DISTINCT fs.sales_id) AS total_orders,
+      COALESCE(SUM(fs.total_amount) / NULLIF(COUNT(DISTINCT fs.sales_id), 0), 0) AS avg_order_value,
+      COUNT(DISTINCT fs.invoice_number) AS total_invoices
     FROM fact_sales fs
     JOIN dim_time dt ON fs.time_id = dt.time_id
     JOIN dim_store ds ON fs.store_id = ds.store_id
     LEFT JOIN dim_node dn ON fs.node_id = dn.node_id
     JOIN product_master pm ON fs.item_code = pm.productid::TEXT
     LEFT JOIN store_master sm ON ds.store_id = sm.storecode::TEXT
-    WHERE dt.business_date >= $1 AND dt.business_date <= $2
-      AND fs.pod IS NOT NULL
   `;
 
-  const queryParams = [startDate, endDate];
-  let paramIndex = 3;
+  const queryParams = [];
+  const whereConditions = [];
+  let paramIndexRef = { current: 1 };
 
-  if (restaurantId && restaurantId !== "all") {
-    query += ` AND ds.store_id = $${paramIndex++}`;
-    queryParams.push(restaurantId);
+  addCommonWhereConditions(
+    whereConditions,
+    queryParams,
+    req.query,
+    paramIndexRef
+  );
+
+  // Specific filter for ocEmailId or omEmailId
+  if (ocEmailId && ocEmailId !== "all") {
+    whereConditions.push(`sm.ocemailid = $${paramIndexRef.current++}`);
+    queryParams.push(ocEmailId);
   }
-
-  if (productFilter && productFilter.type && productFilter.value) {
-    query += ` AND pm.${productFilter.type}::TEXT = $${paramIndex++}`;
-    queryParams.push(productFilter.value);
-  }
-
-  if (storeFilter && storeFilter.type && storeFilter.value) {
-    if (storeFilter.type === "state") {
-      query += ` AND sm.state = $${paramIndex++}`;
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "city") {
-      query += ` AND sm.city = $${paramIndex++}`;
-      queryParams.push(storeFilter.value);
-    } else if (storeFilter.type === "storecode") {
-      query += ` AND ds.store_id = $${paramIndex++}`;
-      queryParams.push(storeFilter.value);
-    }
+  if (omEmailId && omEmailId !== "all") {
+    whereConditions.push(`sm.omemailid = $${paramIndexRef.current++}`);
+    queryParams.push(omEmailId);
   }
 
-  if (machineId && machineId !== "all") {
-    query += ` AND dn.node_id = $${paramIndex++}`;
-    queryParams.push(machineId);
-  }
-  if (transactionType && transactionType !== "all") {
-    query += ` AND fs.sale_type = $${paramIndex++}`;
-    queryParams.push(transactionType);
-  }
-  if (deliveryChannel && deliveryChannel !== "all") {
-    query += ` AND fs.delivery_channel = $${paramIndex++}`;
-    queryParams.push(deliveryChannel);
+  if (whereConditions.length > 0) {
+    query += ` WHERE ` + whereConditions.join(" AND ");
   }
 
   query += `
-    GROUP BY fs.pod
-    ORDER BY value DESC;
+    GROUP BY ds.store_id
+    ORDER BY ds.store_id;
   `;
 
   try {
     const { rows } = await pool.query(query, queryParams);
     const formattedData = rows.map((row) => ({
-      name: row.name,
-      value: parseFloat(row.value || 0),
+      storeName: row.store_name,
+      totalSales: parseFloat(row.total_sales || 0),
+      totalOrders: parseInt(row.total_orders || 0),
+      avgOrderValue: parseFloat(row.avg_order_value || 0),
+      totalInvoices: parseInt(row.total_invoices || 0),
     }));
     res.json(formattedData);
   } catch (err) {
-    console.error("Error fetching sales by pod:", err.stack);
+    console.error(
+      "Error fetching sales by OC/OM and store summary:",
+      err.stack
+    );
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -1468,10 +1483,15 @@ app.get("/api/mock-data", async (req, res) => {
       (row) => row.delivery_channel
     );
 
-    const { rows: podRows } = await pool.query(
-      "SELECT DISTINCT pod FROM fact_sales WHERE pod IS NOT NULL"
+    const { rows: ocEmailIdRows } = await pool.query(
+      "SELECT DISTINCT ocemailid FROM store_master WHERE ocemailid IS NOT NULL ORDER BY ocemailid"
     );
-    const pods = podRows.map((row) => row.pod);
+    const ocEmailIds = ocEmailIdRows.map((row) => row.ocemailid);
+
+    const { rows: omEmailIdRows } = await pool.query(
+      "SELECT DISTINCT omemailid FROM store_master WHERE omemailid IS NOT NULL ORDER BY omemailid"
+    );
+    const omEmailIds = omEmailIdRows.map((row) => row.omemailid);
 
     const dataToCache = {
       restaurants,
@@ -1480,7 +1500,8 @@ app.get("/api/mock-data", async (req, res) => {
       machines,
       transactionTypes,
       deliveryChannels,
-      pods,
+      ocEmailIds, // Added OC emails to cache
+      omEmailIds, // Added OM emails to cache
     };
 
     myCache.set("mockData", dataToCache);
