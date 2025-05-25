@@ -191,21 +191,11 @@ const addCommonWhereConditions = (
 };
 
 app.get("/api/sales", async (req, res) => {
-  let query = `
-    SELECT
-      fs.sales_id,
-      dt.business_date,
-      ds.store_id AS restaurant_id,
-      dn.node_id AS machine_id,
-      pm.productid AS product_id,
-      pm.productname AS product_name,
-      fs.sale_type AS transaction_type,
-      fs.delivery_channel,
-      fs.pod,
-      fs.total_amount,
-      fs.item_qty,
-      di.item_family_group,
-      di.item_day_part
+  const page = parseInt(req.query.page) || 1;
+  const limit = parseInt(req.query.limit) || 100; // Default limit of 100 transactions
+  const offset = (page - 1) * limit;
+
+  let baseQuery = `
     FROM fact_sales fs
     JOIN dim_time dt ON fs.time_id = dt.time_id
     JOIN dim_store ds ON fs.store_id = ds.store_id
@@ -226,14 +216,46 @@ app.get("/api/sales", async (req, res) => {
     paramIndexRef
   );
 
+  let whereClause = "";
   if (whereConditions.length > 0) {
-    query += ` WHERE ` + whereConditions.join(" AND ");
+    whereClause = ` WHERE ` + whereConditions.join(" AND ");
   }
 
-  query += ` ORDER BY dt.business_date DESC, fs.sales_id DESC`;
+  // Query for total count
+  let countQuery = `SELECT COUNT(fs.sales_id) AS total_count ${baseQuery} ${whereClause}`;
+
+  // Query for paginated data
+  let salesQuery = `
+    SELECT
+      fs.sales_id,
+      dt.business_date,
+      ds.store_id AS restaurant_id,
+      dn.node_id AS machine_id,
+      pm.productid AS product_id,
+      pm.productname AS product_name,
+      fs.sale_type AS transaction_type,
+      fs.delivery_channel,
+      fs.pod,
+      fs.total_amount,
+      fs.item_qty,
+      di.item_family_group,
+      di.item_day_part
+    ${baseQuery}
+    ${whereClause}
+    ORDER BY dt.business_date DESC, fs.sales_id DESC
+    LIMIT $${paramIndexRef.current++} OFFSET $${paramIndexRef.current++}
+  `;
 
   try {
-    const { rows } = await pool.query(query, queryParams);
+    const countResult = await pool.query(countQuery, queryParams);
+    const totalCount = parseInt(countResult.rows[0].total_count);
+
+    const { rows } = await pool.query(salesQuery, [
+      ...queryParams,
+      limit,
+      offset,
+    ]);
+
     const formattedTransactions = rows.map((row) => {
       const datePart = new Date(row.business_date);
       return {
@@ -244,7 +266,7 @@ app.get("/api/sales", async (req, res) => {
         machineId: row.machine_id,
         transactionType: row.transaction_type,
         deliveryChannel: row.delivery_channel,
-        pod: row.pod, // Keeping pod for now in Transaction interface
+        pod: row.pod,
         timestamp: datePart.getTime(),
         amount: parseFloat(row.total_amount),
         quantity: parseFloat(row.item_qty),
@@ -252,7 +274,13 @@ app.get("/api/sales", async (req, res) => {
         itemDayPart: row.item_day_part,
       };
     });
-    res.json(formattedTransactions);
+
+    res.json({
+      transactions: formattedTransactions,
+      totalCount,
+      currentPage: page,
+      totalPages: Math.ceil(totalCount / limit),
+    });
   } catch (err) {
     console.error("Error executing sales query", err.stack);
     res.status(500).json({ error: "Internal server error" });
